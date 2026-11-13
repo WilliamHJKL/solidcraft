@@ -8,6 +8,8 @@
 //! | Rust                                   | Status difftest compares                  |
 //! |----------------------------------------|-------------------------------------------|
 //! | [`OffsetFailure::Folds`]               | `SM_ERR` (WR-718, solidcore-native)       |
+//! | [`OffsetFailure::TubeFolds`]           | `SM_ERR` (#13685, solidcore-native)       |
+//! | [`OffsetFailure::TubeNotCertified`]    | `SM_ERR` (#13685, solidcore-native)       |
 //! | [`OffsetFailure::Collapses`]           | `SM_ERR` (#2350, solidcore-native)        |
 //! | [`OffsetFailure::WallsTouch`]          | `SM_ERR_OFFSET_WALLS_TOUCH` (fork a759622) |
 //! | [`OffsetFailure::LoopsCross`]          | `SM_ERR_BAD_INTERSECTIONS` (WR-345)       |
@@ -66,6 +68,26 @@ pub enum OffsetFailure {
     NotCertified {
         /// The face whose offset is not certified.
         face: FaceId,
+        /// The offset distance asked for (signed, as the operation takes it).
+        distance: f64,
+    },
+    /// The tube of radius `|distance|` a rounded offset caps `edge` with folds over itself: the
+    /// edge bends more tightly than that, on the side the tube faces (#13685).
+    TubeFolds {
+        /// The edge whose tube folds.
+        edge: EdgeId,
+        /// The offset distance asked for (signed, as the operation takes it).
+        distance: f64,
+        /// The largest distance at which this edge's tube is proved not to fold, when one is.
+        /// Only the tube is proved there: other defects can still appear at or near it.
+        largest: Option<f64>,
+    },
+    /// The tube of radius `|distance|` a rounded offset caps `edge` with is neither proved
+    /// regular nor proved to fold (#13685): its proof ran out of pieces, or the edge has no
+    /// two faces or no NURBS form to decide it on.
+    TubeNotCertified {
+        /// The edge whose tube is not certified.
+        edge: EdgeId,
         /// The offset distance asked for (signed, as the operation takes it).
         distance: f64,
     },
@@ -276,6 +298,9 @@ impl OffsetFailure {
             Self::EdgeVanishes { edge, face } => edge
                 .map(EntityRef::Edge)
                 .or_else(|| face.map(EntityRef::Face)),
+            Self::TubeFolds { edge, .. } | Self::TubeNotCertified { edge, .. } => {
+                Some(EntityRef::Edge(edge))
+            }
             Self::LoopGapUncertified { face } => face.map(EntityRef::Face),
             Self::ExactCurveUncut
             | Self::TangentEndOffCurve
@@ -311,6 +336,8 @@ impl OffsetFailure {
         match self {
             Self::Folds { .. }
             | Self::NotCertified { .. }
+            | Self::TubeFolds { .. }
+            | Self::TubeNotCertified { .. }
             | Self::Collapses { .. }
             | Self::WallsTouch { .. }
             | Self::LoopsCross { .. }
@@ -340,6 +367,8 @@ impl OffsetFailure {
             Self::Inconsistent(_) => true,
             Self::Folds { .. }
             | Self::NotCertified { .. }
+            | Self::TubeFolds { .. }
+            | Self::TubeNotCertified { .. }
             | Self::Collapses { .. }
             | Self::WallsTouch { .. }
             | Self::LoopsCross { .. }
@@ -364,6 +393,8 @@ impl OffsetFailure {
         match self {
             Self::Folds { .. }
             | Self::NotCertified { .. }
+            | Self::TubeFolds { .. }
+            | Self::TubeNotCertified { .. }
             | Self::Collapses { .. }
             | Self::SeamOpened { .. }
             | Self::FacesApart { .. }
@@ -389,7 +420,10 @@ impl OffsetFailure {
     #[must_use]
     pub const fn kind(&self) -> ErrorKind {
         match self {
-            Self::Folds { .. } | Self::NotCertified { .. } => ErrorKind::OffsetFolds,
+            Self::Folds { .. }
+            | Self::NotCertified { .. }
+            | Self::TubeFolds { .. }
+            | Self::TubeNotCertified { .. } => ErrorKind::OffsetFolds,
             Self::Collapses { .. } => ErrorKind::OffsetCollapses,
             Self::WallsTouch { .. } => ErrorKind::OffsetWallsTouch,
             Self::LoopsCross { .. } => ErrorKind::OffsetLoopsCross,
@@ -523,6 +557,32 @@ impl core::fmt::Display for OffsetFailure {
                  defeats the proof, and no radius of curvature limits the wall, so no size is \
                  named",
                 face.index()
+            ),
+            Self::TubeFolds {
+                edge,
+                distance,
+                largest,
+            } => {
+                write!(
+                    f,
+                    "the rounded offset's tube about edge {} by {distance} folds over itself: \
+                     the edge bends more tightly than that on the side the tube faces",
+                    edge.index()
+                )?;
+                match largest {
+                    Some(r) => write!(
+                        f,
+                        " (the largest distance at which this edge's tube is proved not to \
+                         fold is {r})"
+                    ),
+                    None => f.write_str(" (no distance at which it does not fold is proved)"),
+                }
+            }
+            Self::TubeNotCertified { edge, distance } => write!(
+                f,
+                "the rounded offset's tube about edge {} by {distance} is not proved regular, \
+                 nor proved to fold, so no size is named",
+                edge.index()
             ),
             Self::Collapses {
                 face,
@@ -851,6 +911,25 @@ mod tests {
                 false,
                 false,
             ),
+            (
+                O::TubeFolds {
+                    edge: EdgeId::from_index(2),
+                    distance: 1.2,
+                    largest: Some(1.0),
+                },
+                ErrorKind::OffsetFolds,
+                false,
+                false,
+            ),
+            (
+                O::TubeNotCertified {
+                    edge: EdgeId::from_index(2),
+                    distance: 1.2,
+                },
+                ErrorKind::OffsetFolds,
+                false,
+                false,
+            ),
             (O::Failed("x"), ErrorKind::Failed, true, false),
             (O::Missing("x"), ErrorKind::Missing, true, false),
             (O::InvalidValue("x"), ErrorKind::InvalidInput, true, false),
@@ -874,10 +953,12 @@ mod tests {
                 O::ReachUncertified { .. } => 12,
                 O::LoopGapUncertified { .. } => 13,
                 O::Unsound { .. } => 14,
-                O::Failed(_) => 15,
-                O::Missing(_) => 16,
-                O::InvalidValue(_) => 17,
-                O::Inconsistent(_) => 18,
+                O::TubeFolds { .. } => 15,
+                O::TubeNotCertified { .. } => 16,
+                O::Failed(_) => 17,
+                O::Missing(_) => 18,
+                O::InvalidValue(_) => 19,
+                O::Inconsistent(_) => 20,
             }
         };
         for (i, (o, class, phrase, defect)) in pinned.iter().enumerate() {

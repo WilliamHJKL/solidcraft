@@ -30,12 +30,21 @@ pub struct Soundness {
 }
 
 impl Soundness {
-    /// Whether the check is clean and, when the body is a manifold solid, its volume is
-    /// proved positive (an undecided sign is not).
+    /// Whether the body is sound as the result of an operation on an input that was a
+    /// manifold solid (`input_solid`) or not: the check is clean, and the body is a manifold
+    /// solid whose volume is proved positive (an undecided sign is not), as it must be where
+    /// the input was one; where the input was not, a body that is no manifold solid passes on
+    /// its check alone (a sheet's offset is a sheet). A solid's offset that comes back as two
+    /// loose sheets, or as no face at all, is not sound (#13685).
     #[must_use]
-    pub fn sound(&self) -> bool {
+    pub fn sound(&self, input_solid: bool) -> bool {
+        let positive = matches!(self.volume, Some(VolumeSign::Positive(_)));
         self.check.is_valid()
-            && (!self.manifold || matches!(self.volume, Some(VolumeSign::Positive(_))))
+            && if input_solid {
+                self.manifold && positive
+            } else {
+                !self.manifold || positive
+            }
     }
 }
 
