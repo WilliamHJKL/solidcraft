@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::EmbossFace;
+use crate::MortiseTenonVariant;
 use crate::apply_point;
 use crate::sheet;
 use solidcore_record::{Loop2, Seg2};
@@ -2616,5 +2617,865 @@ fn sheet_rule_values(doc: &Document, vals: &BTreeMap<String, Value>, st: &ModelS
 fn tag_flanges(sh: &mut crate::sheet::SheetBody, from: usize, feature: u64) {
     for (k, fl) in sh.flanges.iter_mut().enumerate().skip(from) {
         fl.tag = format!("F{feature}.{}", k - from);
+    }
+}
+
+/// Exact planar face geometry extracted directly from a body's B-rep record (no meshing).
+#[derive(Clone, Debug)]
+struct PlanarFaceGeom {
+    body_idx: usize,
+    face_idx: usize,
+    plane: Plane,
+    /// Orthonormal axes `(axis_w, axis_e)` in the face plane aligned with its straight edges:
+    /// `axis_w` spans the wider dimension `span_w` and `axis_e` spans the narrower dimension `span_e`.
+    center: Vec3,
+    axis_w: Vec3,
+    axis_e: Vec3,
+    span_w: f64,
+    span_e: f64,
+}
+
+fn brep_vertex(rec: &solidcore_record::brep::Brep, idx: u32) -> Option<Vec3> {
+    let p = rec.vertices.get(idx as usize)?.point;
+    Some(Vec3::new(p[0], p[1], p[2]))
+}
+
+/// Extract exact planar geometry and principal edge-aligned axes for face `face_idx` of `mb`.
+fn planar_face_geom(body_idx: usize, mb: &ModelBody, face_idx: usize) -> Option<PlanarFaceGeom> {
+    if mb.body.is_mesh() {
+        return None;
+    }
+    let plane = mb.body.planar_face(face_idx)?;
+    let n = plane.normal();
+    let rec = mb.body.record();
+    let face = rec.faces.get(face_idx)?;
+    let mut verts = Vec::new();
+    let mut best_dir: Option<(f64, Vec3)> = None;
+    for lp in &face.loops {
+        let solidcore_record::brep::Loop::Edges { edges } = lp else { continue };
+        for eu in edges {
+            let edge = rec.edges.get(eu.edge as usize)?;
+            let a = brep_vertex(rec, edge.vertices[0])?;
+            let b = brep_vertex(rec, edge.vertices[1])?;
+            verts.push(a);
+            verts.push(b);
+            if matches!(edge.curve, solidcore_record::brep::Curve::Line { .. }) {
+                let d = b - a;
+                let in_plane = d - n * d.dot(n);
+                let len = in_plane.len();
+                if len > 1e-6
+                    && best_dir.is_none_or(|(best_len, _)| len > best_len)
+                    && let Some(u) = in_plane.normalized()
+                {
+                    best_dir = Some((len, u));
+                }
+            }
+        }
+    }
+    if verts.is_empty() {
+        return None;
+    }
+    let u0 = best_dir.map(|(_, u)| u).unwrap_or(plane.x);
+    let v0 = n.cross(u0).normalized()?;
+    let (mut min_u, mut max_u) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_v, mut max_v) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in &verts {
+        let d = *p - plane.origin;
+        let u = d.dot(u0);
+        let v = d.dot(v0);
+        min_u = min_u.min(u);
+        max_u = max_u.max(u);
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    let du = max_u - min_u;
+    let dv = max_v - min_v;
+    if !(du > 1e-6 && dv > 1e-6 && du.is_finite() && dv.is_finite()) {
+        return None;
+    }
+    let center = plane.origin + u0 * (0.5 * (min_u + max_u)) + v0 * (0.5 * (min_v + max_v));
+    let (axis_w, axis_e, span_w, span_e) = if du >= dv {
+        (u0, v0, du, dv)
+    } else {
+        // Keep right-handed frame with outward normal `n`: `axis_w.cross(axis_e) == n`.
+        (v0, -u0, dv, du)
+    };
+    Some(PlanarFaceGeom { body_idx, face_idx, plane, center, axis_w, axis_e, span_w, span_e })
+}
+
+/// Whether point `p` lies on planar face `g` within tolerance, and its distance to the face plane.
+fn point_on_planar_face(g: &PlanarFaceGeom, mb: &ModelBody, p: Vec3) -> Option<f64> {
+    let tol = (mb.body.size() * 1e-3).max(1e-3);
+    let d_plane = (p - g.plane.origin).dot(g.plane.normal()).abs();
+    if d_plane > tol {
+        return None;
+    }
+    let rel = p - g.center;
+    let u = rel.dot(g.axis_w).abs();
+    let v = rel.dot(g.axis_e).abs();
+    if u <= 0.5 * g.span_w + tol && v <= 0.5 * g.span_e + tol { Some(d_plane) } else { None }
+}
+
+/// Candidate planar faces on `st` at `p`, optionally restricted to `body_name` or resolved via `face_name`.
+fn planar_candidates_at(st: &ModelState, p: Vec3, body_name: Option<&str>, face_name: Option<&str>) -> Vec<(f64, PlanarFaceGeom)> {
+    if let Some(fname) = face_name.filter(|n| !n.is_empty()) {
+        let hit = match body_name {
+            Some(bname) => st
+                .bodies
+                .iter()
+                .enumerate()
+                .find(|(_, b)| b.name == bname)
+                .and_then(|(bi, b)| crate::name_lookup::locate_on(b, fname, p).map(|h| (bi, h.face))),
+            None => crate::name_lookup::locate_face(st, fname, p).map(|h| (h.body, h.face)),
+        };
+        if let Some((bi, fi)) = hit
+            && let Some(mb) = st.bodies.get(bi)
+            && let Some(g) = planar_face_geom(bi, mb, fi)
+        {
+            return vec![(0.0, g)];
+        }
+    }
+    let mut out = Vec::new();
+    for (bi, mb) in st.bodies.iter().enumerate() {
+        if mb.body.is_mesh() || body_name.is_some_and(|n| mb.name != n) {
+            continue;
+        }
+        for fi in 0..mb.body.face_count() {
+            if let Some(g) = planar_face_geom(bi, mb, fi)
+                && let Some(d) = point_on_planar_face(&g, mb, p)
+            {
+                out.push((d, g));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| (a.1.span_w * a.1.span_e).total_cmp(&(b.1.span_w * b.1.span_e))));
+    out
+}
+
+/// Resolve the rail end face and stile contact face on two distinct bodies.
+fn resolve_mortise_tenon_faces(
+    st: &ModelState,
+    rail_pt: Vec3,
+    stile_pt: Vec3,
+    rail_body: Option<&str>,
+    stile_body: Option<&str>,
+    rail_fname: Option<&str>,
+    stile_fname: Option<&str>,
+) -> Result<(PlanarFaceGeom, PlanarFaceGeom)> {
+    if let Some(rb) = rail_body
+        && st.body(rb).is_none()
+    {
+        return Err(DocError::Unknown(format!("body `{rb}`")));
+    }
+    if let Some(sb) = stile_body
+        && st.body(sb).is_none()
+    {
+        return Err(DocError::Unknown(format!("body `{sb}`")));
+    }
+    let rail_cands = planar_candidates_at(st, rail_pt, rail_body, rail_fname);
+    let stile_cands = planar_candidates_at(st, stile_pt, stile_body, stile_fname);
+    if rail_cands.is_empty() {
+        return Err(DocError::Invalid("no planar rail end face found at `rail_face`".into()));
+    }
+    if stile_cands.is_empty() {
+        return Err(DocError::Invalid("no planar stile contact face found at `stile_face`".into()));
+    }
+    // Prefer a pair on distinct bodies with opposing outward normals (rail_normal · stile_normal ≈ -1).
+    let mut best_opposing: Option<(f64, PlanarFaceGeom, PlanarFaceGeom)> = None;
+    let mut saw_same_body = false;
+    let mut saw_non_opposing = false;
+    for (dr, r) in &rail_cands {
+        for (ds, s) in &stile_cands {
+            if r.body_idx == s.body_idx {
+                saw_same_body = true;
+                continue;
+            }
+            let dot = r.plane.normal().dot(s.plane.normal());
+            if dot <= -1.0 + 1e-4 {
+                // When both picks lie at the shared contact point and neither body was explicitly
+                // named, the smaller-area contact face is the rail end face and the larger face
+                // is the stile side face.
+                let area_r = r.span_w * r.span_e;
+                let area_s = s.span_w * s.span_e;
+                let area_penalty = if rail_body.is_none() && stile_body.is_none() && area_r > area_s + 1e-6 { 1e6 } else { 0.0 };
+                let score = dr + ds + area_penalty;
+                if best_opposing.as_ref().is_none_or(|(b, _, _)| score < *b) {
+                    best_opposing = Some((score, r.clone(), s.clone()));
+                }
+            } else {
+                saw_non_opposing = true;
+            }
+        }
+    }
+    if let Some((_, r, s)) = best_opposing {
+        return Ok((r, s));
+    }
+    if saw_non_opposing {
+        return Err(DocError::Invalid("the selected `rail_face` and `stile_face` are not parallel and opposing planar faces".into()));
+    }
+    if saw_same_body {
+        return Err(DocError::Invalid("`rail_face` and `stile_face` must belong to two distinct timber bodies".into()));
+    }
+    Err(DocError::Invalid("could not resolve opposing planar rail and stile faces".into()))
+}
+
+/// Persistent face names for a `MortiseTenon` feature's `[rail_face, stile_face]` picks.
+pub(super) fn mortise_tenon_face_names(
+    st: &ModelState,
+    rail_pt: Vec3,
+    stile_pt: Vec3,
+    rail_body: Option<&str>,
+    stile_body: Option<&str>,
+) -> Vec<String> {
+    if let Ok((r, s)) = resolve_mortise_tenon_faces(st, rail_pt, stile_pt, rail_body, stile_body, None, None) {
+        let r_name = st.bodies.get(r.body_idx).and_then(|b| crate::naming::face_names(b).get(r.face_idx).cloned()).unwrap_or_default();
+        let s_name = st.bodies.get(s.body_idx).and_then(|b| crate::naming::face_names(b).get(s.face_idx).cloned()).unwrap_or_default();
+        return vec![r_name, s_name];
+    }
+    crate::naming::face_names_at(st, &[rail_pt, stile_pt])
+}
+
+/// Extent `(lo, hi)` of planar face `g`'s edge-aligned rectangle along `dir`, measured from `from`.
+fn face_extent_along(g: &PlanarFaceGeom, from: Vec3, dir: Vec3) -> (f64, f64) {
+    let c = (g.center - from).dot(dir);
+    let half = 0.5 * (g.span_w * g.axis_w.dot(dir).abs() + g.span_e * g.axis_e.dot(dir).abs());
+    (c - half, c + half)
+}
+
+/// Depth of the stile behind its contact face at `at`, along `dir` (pointing into the stile): the
+/// distance to the nearest planar face parallel to the contact face that closes the stile there.
+/// A stile with no such face behind `at` (a curved or sloped back) is measured to its farthest
+/// vertex instead.
+fn stile_depth_at(mb: &ModelBody, body_idx: usize, at: Vec3, dir: Vec3) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for fi in 0..mb.body.face_count() {
+        let Some(g) = planar_face_geom(body_idx, mb, fi) else { continue };
+        if g.plane.normal().dot(dir).abs() < 1.0 - 1e-4 {
+            continue;
+        }
+        let d = (g.plane.origin - at).dot(dir);
+        if !(d > 1e-3 && d.is_finite()) {
+            continue;
+        }
+        let rel = at + dir * d - g.center;
+        if rel.dot(g.axis_w).abs() <= 0.5 * g.span_w + 1e-6 && rel.dot(g.axis_e).abs() <= 0.5 * g.span_e + 1e-6 && best.is_none_or(|b| d < b) {
+            best = Some(d);
+        }
+    }
+    best.or_else(|| {
+        let far = mb.body.record().vertices.iter().map(|v| (Vec3::new(v.point[0], v.point[1], v.point[2]) - at).dot(dir)).fold(0.0_f64, f64::max);
+        (far > 1e-3 && far.is_finite()).then_some(far)
+    })
+}
+
+fn rect_region_2d(u_min: f64, u_max: f64, v_min: f64, v_max: f64) -> Region2 {
+    Region2 {
+        outer: Loop2::polygon(&[Vec2::new(u_min, v_min), Vec2::new(u_max, v_min), Vec2::new(u_max, v_max), Vec2::new(u_min, v_max)]),
+        holes: Vec::new(),
+    }
+}
+
+/// Evaluate a woodworking feature (`FeatureKind::MortiseTenon`).
+pub(super) fn wood_eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st: &mut ModelState) -> Result<()> {
+    let FeatureKind::MortiseTenon {
+        rail_face,
+        stile_face,
+        variant,
+        thickness,
+        length,
+        shoulder,
+        haunch_width,
+        haunch_depth,
+        glue_relief,
+        clearance,
+        offset,
+        rail_body,
+        stile_body,
+    } = &f.kind
+    else {
+        return Err(DocError::Invalid(format!("{} is not a woodworking feature", f.name)));
+    };
+
+    let rail_fname = f.face_names.first().map(String::as_str);
+    let stile_fname = f.face_names.get(1).map(String::as_str);
+    let (rail_geom, stile_geom) =
+        resolve_mortise_tenon_faces(st, rail_face.0, stile_face.0, rail_body.as_deref(), stile_body.as_deref(), rail_fname, stile_fname)?;
+
+    let rail_name = st.bodies.get(rail_geom.body_idx).map(|b| b.name.clone()).ok_or_else(|| DocError::Invalid("rail body".into()))?;
+    let stile_mb = st.bodies.get(stile_geom.body_idx).ok_or_else(|| DocError::Invalid("stile body".into()))?;
+    let stile_name = stile_mb.name.clone();
+
+    // Direction from the rail into the stile along the rail end face's outward normal.
+    let n_r = rail_geom.plane.normal();
+    let contact_gap = (stile_geom.plane.origin - rail_geom.plane.origin).dot(n_r);
+    if contact_gap.abs() > 1e-2 {
+        return Err(DocError::Invalid(format!(
+            "the rail end face on `{rail_name}` and stile contact face on `{stile_name}` are {:.3} mm apart; align them in contact first",
+            contact_gap.abs()
+        )));
+    }
+
+    // Stile depth behind the joint, from exact B-rep faces: what the tenon has in front of it,
+    // not the stile's overall extent (a foot or a return elsewhere on the stile does not count).
+    let stile_depth = stile_depth_at(stile_mb, stile_geom.body_idx, rail_geom.center, n_r)
+        .ok_or_else(|| DocError::Invalid(format!("could not measure positive depth of stile `{stile_name}` along the joint axis")))?;
+
+    // Rail cross-section dimensions on the rail end face:
+    // `w_rail` >= `e_rail` (`w_rail` = rail width along `axis_w`, `e_rail` = rail thickness along `axis_e`).
+    let w_rail = rail_geom.span_w;
+    let e_rail = rail_geom.span_e;
+
+    // 1. Tenon thickness `t_tenon` (default: 1/3 of rail thickness `e_rail`, standard rule of thirds).
+    let t_tenon = match thickness {
+        Some(e) => val(vals, e, Kind::Length)?,
+        None => e_rail / 3.0,
+    };
+    if !(t_tenon > 0.0 && t_tenon.is_finite()) {
+        return Err(DocError::Invalid("tenon thickness must be positive".into()));
+    }
+    if t_tenon >= e_rail - 1e-6 {
+        return Err(DocError::Invalid(format!("tenon thickness ({t_tenon:.3} mm) must be strictly less than the rail thickness ({e_rail:.3} mm)")));
+    }
+
+    // 2. Lateral offset across the rail thickness (`axis_e`), default 0 (centered).
+    let off = match offset {
+        Some(e) => val(vals, e, Kind::Length)?,
+        None => 0.0,
+    };
+    if !off.is_finite() || off.abs() + 0.5 * t_tenon >= 0.5 * e_rail - 1e-6 {
+        return Err(DocError::Invalid(format!(
+            "tenon offset ({off:.3} mm) places the {t_tenon:.3} mm tenon outside the {e_rail:.3} mm rail thickness"
+        )));
+    }
+
+    // 3. Clearance (default 0.0 mm) and glue relief at bottom of blind mortises (default 2.0 mm).
+    let clr = match clearance {
+        Some(e) => val(vals, e, Kind::Length)?,
+        None => 0.0,
+    };
+    if !(clr >= 0.0 && clr.is_finite()) {
+        return Err(DocError::Invalid("joint clearance must be zero or positive".into()));
+    }
+    let relief = match glue_relief {
+        Some(e) => val(vals, e, Kind::Length)?,
+        None => match variant {
+            MortiseTenonVariant::Classic | MortiseTenonVariant::Haunched => 2.0,
+            MortiseTenonVariant::Through | MortiseTenonVariant::Bridle => 0.0,
+        },
+    };
+    if !(relief >= 0.0 && relief.is_finite()) {
+        return Err(DocError::Invalid("glue relief must be zero or positive".into()));
+    }
+
+    // 4. Tenon length `l_tenon`:
+    // - For `Through` / `Bridle`: defaults to full stile depth `stile_depth`.
+    // - For `Classic` / `Haunched`: defaults to 2/3 of `stile_depth` rounded to the nearest 5 mm
+    //   (clamped so `l_tenon + relief < stile_depth`).
+    let l_tenon = match length {
+        Some(e) => val(vals, e, Kind::Length)?,
+        None => match variant {
+            MortiseTenonVariant::Through | MortiseTenonVariant::Bridle => stile_depth,
+            MortiseTenonVariant::Classic | MortiseTenonVariant::Haunched => {
+                let raw = (stile_depth * (2.0 / 3.0) / 5.0).round() * 5.0;
+                let max_blind = (stile_depth - relief - 2.0).max(stile_depth * 0.5);
+                raw.clamp(5.0_f64.min(max_blind), max_blind)
+            }
+        },
+    };
+    if !(l_tenon > 0.0 && l_tenon.is_finite()) {
+        return Err(DocError::Invalid("tenon length must be positive".into()));
+    }
+    if matches!(variant, MortiseTenonVariant::Classic | MortiseTenonVariant::Haunched) && l_tenon + relief >= stile_depth - 1e-6 {
+        return Err(DocError::Invalid(format!(
+            "blind mortise depth ({:.3} mm = {:.3} mm tenon + {:.3} mm glue relief) reaches through the {:.3} mm stile `{stile_name}`; reduce `length` or `glue_relief`, or use `variant: through`",
+            l_tenon + relief,
+            l_tenon,
+            relief,
+            stile_depth
+        )));
+    }
+
+    // 5. Shoulder width along `axis_w`:
+    // - `Bridle`: open across the full rail width (`shoulder = 0`).
+    // - `Classic` / `Through`: symmetric shoulder on both sides of `axis_w` (default: `(e_rail - t_tenon) / 2` clamped to `< w_rail / 4`).
+    // - `Haunched`: bottom shoulder `s_w` on `-axis_w`, and haunch of width `h_w` and depth `h_d` on `+axis_w`.
+    let default_shoulder = ((e_rail - t_tenon) * 0.5).min(w_rail * 0.2);
+    let s_w = match shoulder {
+        Some(e) => val(vals, e, Kind::Length)?,
+        None => match variant {
+            MortiseTenonVariant::Bridle => 0.0,
+            MortiseTenonVariant::Classic | MortiseTenonVariant::Through | MortiseTenonVariant::Haunched => default_shoulder,
+        },
+    };
+    if !(s_w >= 0.0 && s_w.is_finite()) {
+        return Err(DocError::Invalid("tenon shoulder must be zero or positive".into()));
+    }
+
+    let work_plane =
+        Plane::new(rail_geom.center, rail_geom.axis_w, rail_geom.axis_e).ok_or_else(|| DocError::Invalid("rail end face frame".into()))?;
+    let v_lo = off - 0.5 * t_tenon;
+    let v_hi = off + 0.5 * t_tenon;
+    // Slight back-overlap into the rail body so the boolean union merges cleanly with the rail end face.
+    let join_back = -0.1_f64.min(e_rail * 0.05);
+    let through_overcut = 0.5_f64;
+
+    // Where the stile contact face lies around the rail end face, in the rail's own frame:
+    // `gap_lo` / `gap_hi` are how far the stile runs past the rail's two edges across its width
+    // (zero when the rail is flush with the end of the stile).
+    let (sw_lo, sw_hi) = face_extent_along(&stile_geom, rail_geom.center, rail_geom.axis_w);
+    let (se_lo, se_hi) = face_extent_along(&stile_geom, rail_geom.center, rail_geom.axis_e);
+    let gap_lo = -0.5 * w_rail - sw_lo;
+    let gap_hi = sw_hi - 0.5 * w_rail;
+    let fit = 1e-6;
+    // The tenon (`u_min..u_max` across the rail width) must land on the stile contact face, and
+    // the mortise must keep a cheek of stile on both sides of the tenon's thickness.
+    let check_landing = |u_min: f64, u_max: f64| -> Result<()> {
+        if u_min < sw_lo - fit || u_max > sw_hi + fit || v_lo < se_lo - fit || v_hi > se_hi + fit {
+            return Err(DocError::Invalid(format!(
+                "the tenon on `{rail_name}` does not land on the contact face of `{stile_name}`; move the rail onto the stile, or pick the two faces that touch"
+            )));
+        }
+        if v_lo - clr <= se_lo + fit || v_hi + clr >= se_hi - fit {
+            return Err(DocError::Invalid(format!(
+                "the mortise leaves no cheek in `{stile_name}` ({:.3} mm and {:.3} mm); reduce `thickness`, `clearance` or `offset`",
+                (v_lo - clr - se_lo).max(0.0),
+                (se_hi - v_hi - clr).max(0.0)
+            )));
+        }
+        Ok(())
+    };
+
+    match variant {
+        MortiseTenonVariant::Classic | MortiseTenonVariant::Through | MortiseTenonVariant::Bridle => {
+            if 2.0 * s_w >= w_rail - 1e-6 {
+                return Err(DocError::Invalid(format!(
+                    "twice the shoulder ({:.3} mm) leaves no tenon width across the {:.3} mm rail",
+                    2.0 * s_w,
+                    w_rail
+                )));
+            }
+            let u_lo = -0.5 * w_rail + s_w;
+            let u_hi = 0.5 * w_rail - s_w;
+            check_landing(u_lo, u_hi)?;
+            // A bridle is an open slot at the end of the stile: the rail has to sit at that end,
+            // and the tongue runs the rail's full width.
+            let (open_lo, open_hi) = (gap_lo <= fit, gap_hi <= fit);
+            if *variant == MortiseTenonVariant::Bridle {
+                if s_w > fit {
+                    return Err(DocError::Invalid(
+                        "a bridle joint has no shoulder across the rail width; leave `shoulder` out, or use `variant: through`".into(),
+                    ));
+                }
+                if !(open_lo || open_hi) {
+                    return Err(DocError::Invalid(format!(
+                        "a bridle joint needs the rail flush with the end of the stile `{stile_name}` (the nearest end is {:.3} mm away); move the rail to that end, or use `variant: through`",
+                        gap_lo.min(gap_hi)
+                    )));
+                }
+            }
+            let tenon_reg = rect_region_2d(u_lo, u_hi, v_lo, v_hi);
+            let tenon_bodies = kernel::extrude(&work_plane, &[tenon_reg], join_back, l_tenon)?;
+            let tenon_tools = tenon_bodies.into_iter().map(|b| crate::lineage::part_tool(b, "tenon")).collect();
+            apply_traced(doc, st, f, tenon_tools, Operation::Join, std::slice::from_ref(&rail_name))?;
+
+            // Mortise cut in the stile: expanded by `clr` on the mating cheeks/shoulders, and
+            // overcut past the entry face (and far face for `Through` / `Bridle`).
+            // A bridle slot is cut past the open end of the stile, so no sliver is left there.
+            let bridle = *variant == MortiseTenonVariant::Bridle;
+            let mu_lo = u_lo - clr - if bridle && open_lo { through_overcut } else { 0.0 };
+            let mu_hi = u_hi + clr + if bridle && open_hi { through_overcut } else { 0.0 };
+            let mv_lo = v_lo - clr;
+            let mv_hi = v_hi + clr;
+            let mortise_depth = match variant {
+                MortiseTenonVariant::Through | MortiseTenonVariant::Bridle => l_tenon.max(stile_depth) + through_overcut,
+                MortiseTenonVariant::Classic | MortiseTenonVariant::Haunched => l_tenon + relief,
+            };
+            let mortise_reg = rect_region_2d(mu_lo, mu_hi, mv_lo, mv_hi);
+            let mortise_bodies = kernel::extrude(&work_plane, &[mortise_reg], -through_overcut, mortise_depth)?;
+            let mortise_tools = mortise_bodies.into_iter().map(|b| crate::lineage::part_tool(b, "mortise")).collect();
+            apply_traced(doc, st, f, mortise_tools, Operation::Cut, std::slice::from_ref(&stile_name))
+        }
+        MortiseTenonVariant::Haunched => {
+            let h_w = match haunch_width {
+                Some(e) => val(vals, e, Kind::Length)?,
+                None => (w_rail * 0.2).max(t_tenon),
+            };
+            let h_d = match haunch_depth {
+                Some(e) => val(vals, e, Kind::Length)?,
+                None => t_tenon.min(l_tenon * 0.4),
+            };
+            if !(h_w > 0.0 && h_w.is_finite() && h_d > 0.0 && h_d.is_finite()) {
+                return Err(DocError::Invalid("haunch width and haunch depth must be positive".into()));
+            }
+            if h_d >= l_tenon - 1e-6 {
+                return Err(DocError::Invalid(format!("haunch depth ({h_d:.3} mm) must be strictly less than the tenon length ({l_tenon:.3} mm)")));
+            }
+            if s_w + h_w >= w_rail - 1e-6 {
+                return Err(DocError::Invalid(format!(
+                    "shoulder ({s_w:.3} mm) plus haunch width ({h_w:.3} mm) leaves no main tenon width across the {w_rail:.3} mm rail"
+                )));
+            }
+            let u_lo = -0.5 * w_rail + s_w;
+            let u_main_hi = 0.5 * w_rail - h_w;
+            let u_haunch_hi = 0.5 * w_rail;
+            // The haunch goes on the edge of the rail nearest the end of the stile, where a full
+            // mortise would break out. The intervals below are written for the `+axis_w` edge
+            // and mirrored when the nearer end is the other one.
+            let flip = gap_lo < gap_hi;
+            let side = |lo: f64, hi: f64| if flip { (-hi, -lo) } else { (lo, hi) };
+            let rect = |lo: f64, hi: f64, v0: f64, v1: f64| {
+                let (a, b) = side(lo, hi);
+                rect_region_2d(a, b, v0, v1)
+            };
+            let (t_lo, t_hi) = side(u_lo, u_haunch_hi);
+            check_landing(t_lo, t_hi)?;
+
+            // Main tenon body + shorter haunch step joined onto the rail.
+            let main_reg = rect(u_lo, u_main_hi, v_lo, v_hi);
+            let haunch_reg = rect(u_main_hi - 0.1_f64.min(h_w * 0.1), u_haunch_hi, v_lo, v_hi);
+            let mut tenon_tools = Vec::new();
+            for b in kernel::extrude(&work_plane, &[main_reg], join_back, l_tenon)? {
+                tenon_tools.push(crate::lineage::part_tool(b, "tenon"));
+            }
+            for b in kernel::extrude(&work_plane, &[haunch_reg], join_back, h_d)? {
+                tenon_tools.push(crate::lineage::part_tool(b, "haunch"));
+            }
+            apply_traced(doc, st, f, tenon_tools, Operation::Join, std::slice::from_ref(&rail_name))?;
+
+            // Matching stepped mortise cut into the stile.
+            let mortise_main = rect(u_lo - clr, u_main_hi + clr, v_lo - clr, v_hi + clr);
+            let mortise_haunch = rect(u_main_hi - clr, u_haunch_hi + clr, v_lo - clr, v_hi + clr);
+            let mut mortise_tools = Vec::new();
+            for b in kernel::extrude(&work_plane, &[mortise_main], -through_overcut, l_tenon + relief)? {
+                mortise_tools.push(crate::lineage::part_tool(b, "mortise"));
+            }
+            for b in kernel::extrude(&work_plane, &[mortise_haunch], -through_overcut, h_d + clr)? {
+                mortise_tools.push(crate::lineage::part_tool(b, "haunch_mortise"));
+            }
+            apply_traced(doc, st, f, mortise_tools, Operation::Cut, std::slice::from_ref(&stile_name))
+        }
+    }
+}
+
+#[cfg(test)]
+mod wood_tests {
+    use solidcore_record::Vec3;
+    use solidcraft_kernel as kernel;
+
+    use crate::{Document, FacePick, FeatureKind, Model, MortiseTenonVariant, Operation, point_expr};
+
+    fn frame_corner_doc() -> Document {
+        frame_corner_doc_at(220.0)
+    }
+
+    /// A 45 x 24 x 300 mm stile standing on the origin and a 200 x 24 x 60 mm rail butting its
+    /// `X = 45` face, the rail's lower edge at height `rail_z`.
+    fn frame_corner_doc_at(rail_z: f64) -> Document {
+        let mut doc = Document::new("Test");
+        let id_stile = doc
+            .add_feature(
+                FeatureKind::Box {
+                    corner: point_expr(Vec3::new(0.0, 0.0, 0.0)),
+                    length: "45 mm".into(),
+                    width: "24 mm".into(),
+                    height: "300 mm".into(),
+                    operation: Operation::NewBody,
+                },
+                Some("Stile"),
+            )
+            .unwrap();
+        doc.feature_mut(id_stile).unwrap().body_names = vec!["Stile".into()];
+
+        let id_rail = doc
+            .add_feature(
+                FeatureKind::Box {
+                    corner: point_expr(Vec3::new(45.0, 0.0, rail_z)),
+                    length: "200 mm".into(),
+                    width: "24 mm".into(),
+                    height: "60 mm".into(),
+                    operation: Operation::NewBody,
+                },
+                Some("Rail"),
+            )
+            .unwrap();
+        doc.feature_mut(id_rail).unwrap().body_names = vec!["Rail".into()];
+        doc
+    }
+
+    fn body_volume(doc: &Document, name: &str) -> f64 {
+        let mut model = Model::new();
+        model.evaluate(doc);
+        let errors: Vec<_> = model.results.iter().filter_map(|r| r.error.as_deref()).collect();
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let st = model.state();
+        let mb = st.body(name).unwrap_or_else(|| panic!("missing body {name}"));
+        kernel::measure(&mb.body).unwrap().volume
+    }
+
+    #[test]
+    fn classic_mortise_tenon_uses_rule_of_thirds_and_glue_relief() {
+        let mut doc = frame_corner_doc();
+        let v_stile_0 = body_volume(&doc, "Stile");
+        let v_rail_0 = body_volume(&doc, "Rail");
+
+        doc.add_feature(
+            FeatureKind::MortiseTenon {
+                rail_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                stile_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                variant: MortiseTenonVariant::Classic,
+                thickness: None,
+                length: None,
+                shoulder: None,
+                haunch_width: None,
+                haunch_depth: None,
+                glue_relief: None,
+                clearance: None,
+                offset: None,
+                rail_body: Some("Rail".into()),
+                stile_body: Some("Stile".into()),
+            },
+            Some("MT"),
+        )
+        .unwrap();
+
+        let v_stile_1 = body_volume(&doc, "Stile");
+        let v_rail_1 = body_volume(&doc, "Rail");
+
+        let tenon_added = v_rail_1 - v_rail_0;
+        let mortise_removed = v_stile_0 - v_stile_1;
+        assert!((tenon_added - 8.0 * 44.0 * 30.0).abs() < 1.0, "tenon_added = {tenon_added}");
+        assert!((mortise_removed - 8.0 * 44.0 * 32.0).abs() < 1.0, "mortise_removed = {mortise_removed}");
+    }
+
+    #[test]
+    fn through_and_bridle_and_haunched_variants_build_cleanly() {
+        // 1. Through mortise and tenon
+        let mut doc = frame_corner_doc();
+        let v_stile_0 = body_volume(&doc, "Stile");
+        let v_rail_0 = body_volume(&doc, "Rail");
+        doc.add_feature(
+            FeatureKind::MortiseTenon {
+                rail_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                stile_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                variant: MortiseTenonVariant::Through,
+                thickness: Some("8 mm".into()),
+                length: None,
+                shoulder: Some("10 mm".into()),
+                haunch_width: None,
+                haunch_depth: None,
+                glue_relief: None,
+                clearance: None,
+                offset: None,
+                rail_body: Some("Rail".into()),
+                stile_body: Some("Stile".into()),
+            },
+            Some("MT"),
+        )
+        .unwrap();
+        let tenon_added = body_volume(&doc, "Rail") - v_rail_0;
+        let mortise_removed = v_stile_0 - body_volume(&doc, "Stile");
+        assert!((tenon_added - 8.0 * 40.0 * 45.0).abs() < 1.0, "tenon_added = {tenon_added}");
+        assert!((mortise_removed - 8.0 * 40.0 * 45.0).abs() < 1.0, "mortise_removed = {mortise_removed}");
+
+        // 2. Bridle joint: the rail flush with the top end of the stile (Z = 240..300)
+        let mut doc = frame_corner_doc_at(240.0);
+        let v_stile_0 = body_volume(&doc, "Stile");
+        let v_rail_0 = body_volume(&doc, "Rail");
+        doc.add_feature(
+            FeatureKind::MortiseTenon {
+                rail_face: FacePick(Vec3::new(45.0, 12.0, 270.0)),
+                stile_face: FacePick(Vec3::new(45.0, 12.0, 270.0)),
+                variant: MortiseTenonVariant::Bridle,
+                thickness: Some("8 mm".into()),
+                length: None,
+                shoulder: None,
+                haunch_width: None,
+                haunch_depth: None,
+                glue_relief: None,
+                clearance: None,
+                offset: None,
+                rail_body: Some("Rail".into()),
+                stile_body: Some("Stile".into()),
+            },
+            Some("MT"),
+        )
+        .unwrap();
+        let tenon_added = body_volume(&doc, "Rail") - v_rail_0;
+        let mortise_removed = v_stile_0 - body_volume(&doc, "Stile");
+        assert!((tenon_added - 8.0 * 60.0 * 45.0).abs() < 1.0, "tenon_added = {tenon_added}");
+        assert!((mortise_removed - 8.0 * 60.0 * 45.0).abs() < 1.0, "mortise_removed = {mortise_removed}");
+
+        // 3. Haunched mortise and tenon
+        let mut doc = frame_corner_doc();
+        let v_stile_0 = body_volume(&doc, "Stile");
+        let v_rail_0 = body_volume(&doc, "Rail");
+        doc.add_feature(
+            FeatureKind::MortiseTenon {
+                rail_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                stile_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                variant: MortiseTenonVariant::Haunched,
+                thickness: Some("8 mm".into()),
+                length: Some("30 mm".into()),
+                shoulder: Some("6 mm".into()),
+                haunch_width: Some("12 mm".into()),
+                haunch_depth: Some("10 mm".into()),
+                glue_relief: Some("2 mm".into()),
+                clearance: None,
+                offset: None,
+                rail_body: Some("Rail".into()),
+                stile_body: Some("Stile".into()),
+            },
+            Some("MT"),
+        )
+        .unwrap();
+        let tenon_added = body_volume(&doc, "Rail") - v_rail_0;
+        let mortise_removed = v_stile_0 - body_volume(&doc, "Stile");
+        let expected_tenon = 8.0 * (42.0 * 30.0 + 12.0 * 10.0);
+        let expected_mortise = 8.0 * (42.0 * 32.0 + 12.0 * 10.0);
+        assert!((tenon_added - expected_tenon).abs() < 1.0, "tenon_added = {tenon_added}, expected = {expected_tenon}");
+        assert!((mortise_removed - expected_mortise).abs() < 1.0, "mortise_removed = {mortise_removed}, expected = {expected_mortise}");
+    }
+
+    #[test]
+    fn refuses_blind_tenon_reaching_through_stile_or_oversized_thickness() {
+        let mut doc = frame_corner_doc();
+        doc.add_feature(
+            FeatureKind::MortiseTenon {
+                rail_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                stile_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                variant: MortiseTenonVariant::Classic,
+                thickness: None,
+                length: Some("44 mm".into()),
+                shoulder: None,
+                haunch_width: None,
+                haunch_depth: None,
+                glue_relief: Some("2 mm".into()),
+                clearance: None,
+                offset: None,
+                rail_body: Some("Rail".into()),
+                stile_body: Some("Stile".into()),
+            },
+            Some("MT"),
+        )
+        .unwrap();
+        let mut model = Model::new();
+        model.evaluate(&doc);
+        let errors: Vec<_> = model.results.iter().filter_map(|r| r.error.as_deref()).collect();
+        assert!(errors.iter().any(|e| e.contains("reaches through")), "errors: {errors:?}");
+
+        let mut doc = frame_corner_doc();
+        doc.add_feature(
+            FeatureKind::MortiseTenon {
+                rail_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                stile_face: FacePick(Vec3::new(45.0, 12.0, 250.0)),
+                variant: MortiseTenonVariant::Classic,
+                thickness: Some("24 mm".into()),
+                length: None,
+                shoulder: None,
+                haunch_width: None,
+                haunch_depth: None,
+                glue_relief: None,
+                clearance: None,
+                offset: None,
+                rail_body: Some("Rail".into()),
+                stile_body: Some("Stile".into()),
+            },
+            Some("MT"),
+        )
+        .unwrap();
+        let mut model = Model::new();
+        model.evaluate(&doc);
+        let errors: Vec<_> = model.results.iter().filter_map(|r| r.error.as_deref()).collect();
+        assert!(errors.iter().any(|e| e.contains("strictly less than the rail thickness")), "errors: {errors:?}");
+    }
+
+    fn joint(variant: MortiseTenonVariant, rail_z: f64, stile_z: f64) -> FeatureKind {
+        FeatureKind::MortiseTenon {
+            rail_face: FacePick(Vec3::new(45.0, 12.0, rail_z)),
+            stile_face: FacePick(Vec3::new(45.0, 12.0, stile_z)),
+            variant,
+            thickness: Some("8 mm".into()),
+            length: None,
+            shoulder: None,
+            haunch_width: None,
+            haunch_depth: None,
+            glue_relief: None,
+            clearance: None,
+            offset: None,
+            rail_body: Some("Rail".into()),
+            stile_body: Some("Stile".into()),
+        }
+    }
+
+    fn errors_of(doc: &Document) -> Vec<String> {
+        let mut model = Model::new();
+        model.evaluate(doc);
+        model.results.iter().filter_map(|r| r.error.clone()).collect()
+    }
+
+    fn in_rail(doc: &Document, p: Vec3) -> bool {
+        let mut model = Model::new();
+        model.evaluate(doc);
+        let st = model.state();
+        let mb = st.body("Rail").unwrap();
+        mb.body.classify_point(p).unwrap() == kernel::PointClass::Inside
+    }
+
+    #[test]
+    fn haunch_goes_on_the_edge_nearest_the_stile_end() {
+        // Rail at Z = 220..280 on a 300 mm stile: the top end is 20 mm away, the bottom 220 mm.
+        // Defaults: haunch 12 mm wide and 8 mm deep, opposite shoulder 8 mm.
+        let mut doc = frame_corner_doc_at(220.0);
+        doc.add_feature(joint(MortiseTenonVariant::Haunched, 250.0, 250.0), Some("MT")).unwrap();
+        assert!(in_rail(&doc, Vec3::new(41.0, 12.0, 275.0)), "haunch expected at the top edge");
+        assert!(!in_rail(&doc, Vec3::new(41.0, 12.0, 223.0)), "shoulder expected at the bottom edge");
+
+        // Rail at Z = 20..80: now the bottom end of the stile is the near one.
+        let mut doc = frame_corner_doc_at(20.0);
+        doc.add_feature(joint(MortiseTenonVariant::Haunched, 50.0, 50.0), Some("MT")).unwrap();
+        assert!(in_rail(&doc, Vec3::new(41.0, 12.0, 25.0)), "haunch expected at the bottom edge");
+        assert!(!in_rail(&doc, Vec3::new(41.0, 12.0, 77.0)), "shoulder expected at the top edge");
+    }
+
+    #[test]
+    fn refuses_bridle_away_from_the_stile_end_and_tenon_off_the_stile() {
+        // A bridle needs the rail at the end of the stile; here the end is 20 mm away.
+        let mut doc = frame_corner_doc_at(220.0);
+        doc.add_feature(joint(MortiseTenonVariant::Bridle, 250.0, 250.0), Some("MT")).unwrap();
+        let errors = errors_of(&doc);
+        assert!(errors.iter().any(|e| e.contains("flush with the end of the stile")), "errors: {errors:?}");
+
+        // A rail above the stile: its end face is in the plane of the stile face, but not on it.
+        let mut doc = frame_corner_doc_at(320.0);
+        doc.add_feature(joint(MortiseTenonVariant::Classic, 350.0, 250.0), Some("MT")).unwrap();
+        let errors = errors_of(&doc);
+        assert!(errors.iter().any(|e| e.contains("does not land on the contact face")), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn stile_depth_is_measured_behind_the_joint_not_over_the_whole_stile() {
+        // A foot joined behind the bottom of the stile (X = -30..0, Z = 0..40) makes the stile
+        // 75 mm deep overall, but it is still 45 mm deep behind the rail: the default tenon
+        // stays 30 mm long (2/3 of 45 mm), in a 32 mm mortise.
+        let mut doc = frame_corner_doc();
+        doc.add_feature(
+            FeatureKind::Box {
+                corner: point_expr(Vec3::new(-30.0, 0.0, 0.0)),
+                length: "30 mm".into(),
+                width: "24 mm".into(),
+                height: "40 mm".into(),
+                operation: Operation::Join,
+            },
+            Some("Foot"),
+        )
+        .unwrap();
+        let v_stile_0 = body_volume(&doc, "Stile");
+        assert!((v_stile_0 - (45.0 * 24.0 * 300.0 + 30.0 * 24.0 * 40.0)).abs() < 1.0, "foot not joined: {v_stile_0}");
+        let v_rail_0 = body_volume(&doc, "Rail");
+        doc.add_feature(joint(MortiseTenonVariant::Classic, 250.0, 250.0), Some("MT")).unwrap();
+        let tenon_added = body_volume(&doc, "Rail") - v_rail_0;
+        let mortise_removed = v_stile_0 - body_volume(&doc, "Stile");
+        assert!((tenon_added - 8.0 * 44.0 * 30.0).abs() < 1.0, "tenon_added = {tenon_added}");
+        assert!((mortise_removed - 8.0 * 44.0 * 32.0).abs() < 1.0, "mortise_removed = {mortise_removed}");
     }
 }

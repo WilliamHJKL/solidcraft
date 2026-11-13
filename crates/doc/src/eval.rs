@@ -10257,6 +10257,7 @@ fn eval_feature(
             }
             Ok(())
         }
+        FeatureKind::MortiseTenon { .. } => more::wood_eval(doc, vals, f, st),
     }
 }
 
@@ -10640,6 +10641,14 @@ pub fn face_point_state<'a>(doc: &Document, st: &'a ModelState, kind: &FeatureKi
 /// named on the bodies of the feature's own component first: each component's bodies lie in its
 /// own coordinates there, where a part inserted twice has a face at the same point in each.
 pub fn face_point_names(doc: &Document, st: &ModelState, kind: &FeatureKind, comp: u64) -> Result<Vec<String>> {
+    if let FeatureKind::MortiseTenon { rail_face, stile_face, rail_body, stile_body, .. } = kind {
+        let own = ModelState { bodies: st.bodies.iter().filter(|b| doc.model_body_component(b) == comp).cloned().collect(), ..ModelState::default() };
+        let names = more::mortise_tenon_face_names(&own, rail_face.0, stile_face.0, rail_body.as_deref(), stile_body.as_deref());
+        if names.iter().all(|n| !n.is_empty()) {
+            return Ok(names);
+        }
+        return Ok(more::mortise_tenon_face_names(st, rail_face.0, stile_face.0, rail_body.as_deref(), stile_body.as_deref()));
+    }
     let pts = kind.face_points();
     if !matches!(kind, FeatureKind::Extrude { .. } | FeatureKind::Revolve { .. }) {
         let own = ModelState { bodies: st.bodies.iter().filter(|b| doc.model_body_component(b) == comp).cloned().collect(), ..ModelState::default() };

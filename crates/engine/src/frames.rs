@@ -91,6 +91,7 @@ fn table(id: &str) -> &'static [(&'static str, K)] {
             &[("position", Pick), ("direction", Dir), ("hook", Dir), ("along", Dir), ("body", Body)]
         }
         "plastic.lip" => &[("face", Pick), ("body", Body)],
+        "wood.mortise_tenon" => &[("rail_face", Pick), ("stile_face", Pick), ("rail_body", Body), ("stile_body", Body)],
         "sheet.convert" => &[("face", Pick), ("bends", Picks), ("body", Body)],
         "sheet.flange" | "sheet.hem" => &[("edges", Picks), ("body", Body)],
         "sheet.fold" => &[("points", Picks), ("fixed", Pick), ("body", Body)],

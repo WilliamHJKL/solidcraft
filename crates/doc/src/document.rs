@@ -2093,6 +2093,74 @@ pub enum FeatureKind {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         patch_holes: bool,
     },
+    /// Woodworking mortise-and-tenon or bridle joint between two abutting timber bodies:
+    /// a tenon (or open slot) on the rail end face and a matching mortise (or tongue) in
+    /// the stile contact face.
+    MortiseTenon {
+        rail_face: FacePick,
+        stile_face: FacePick,
+        #[serde(default, skip_serializing_if = "MortiseTenonVariant::is_classic")]
+        variant: MortiseTenonVariant,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Tenon thickness")]
+        thickness: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Tenon length")]
+        length: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Shoulder")]
+        shoulder: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Haunch width")]
+        haunch_width: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Haunch depth")]
+        haunch_depth: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Glue relief")]
+        glue_relief: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Clearance")]
+        clearance: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Offset")]
+        offset: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rail_body: Option<BodyName>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stile_body: Option<BodyName>,
+    },
+}
+
+/// Woodworking mortise-and-tenon joint variant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MortiseTenonVariant {
+    /// Four-shouldered blind mortise and tenon (default).
+    #[default]
+    Classic,
+    /// Blind mortise and tenon with a shorter outer haunch step (renfort / épaulement bâtard).
+    Haunched,
+    /// Tenon passing all the way through the stile thickness.
+    Through,
+    /// Open slot at the end of the stile receiving an open tenon on the rail (enfourchement).
+    Bridle,
+}
+
+impl MortiseTenonVariant {
+    pub fn is_classic(&self) -> bool {
+        *self == MortiseTenonVariant::Classic
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "classic" => Some(Self::Classic),
+            "haunched" => Some(Self::Haunched),
+            "through" => Some(Self::Through),
+            "bridle" => Some(Self::Bridle),
+            _ => None,
+        }
+    }
 }
 
 /// A fillet corner set back: the vertex at `vertex`, where every edge is rounded, has its corner
@@ -2864,6 +2932,7 @@ impl FeatureKind {
             FeatureKind::MeshImport { .. } => "MeshFeature",
             FeatureKind::MeshConvert { .. } => "MeshConvertFeature",
             FeatureKind::Repair { .. } => "RepairFeature",
+            FeatureKind::MortiseTenon { .. } => "MortiseTenonFeature",
         }
     }
 
@@ -2947,6 +3016,7 @@ impl FeatureKind {
             FeatureKind::MeshConvert { .. } => "mesh_convert",
             FeatureKind::MeshImport { .. } => "mesh_import",
             FeatureKind::Repair { .. } => "repair",
+            FeatureKind::MortiseTenon { .. } => "mortise_tenon",
         }
     }
 
@@ -3029,6 +3099,7 @@ impl FeatureKind {
             "MeshFeature" => "mesh_import",
             "MeshConvertFeature" => "mesh_convert",
             "RepairFeature" => "repair",
+            "MortiseTenonFeature" => "mortise_tenon",
             _ => return None,
         })
     }
@@ -3116,6 +3187,7 @@ impl FeatureKind {
             FeatureKind::MeshImport { .. } => "Mesh",
             FeatureKind::MeshConvert { .. } => "ConvertMesh",
             FeatureKind::Repair { .. } => "Repair",
+            FeatureKind::MortiseTenon { .. } => "MortiseTenon",
         }
     }
 }

@@ -246,3 +246,5 @@ mesh_convert
 mesh_import
 repair
   remap_bodies: body
+mortise_tenon
+  remap_bodies: rail_body, stile_body

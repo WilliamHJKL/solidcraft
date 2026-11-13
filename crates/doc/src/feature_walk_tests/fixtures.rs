@@ -245,6 +245,22 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
         ("mesh_convert", json!({"type": "mesh_convert", "body": "B", "tolerance": "mesh_convert.tolerance"})),
         ("mesh_import", json!({"type": "mesh_import", "file": "a.stl", "meshes": []})),
         ("repair", json!({"type": "repair", "body": "B", "gap": "repair.gap", "patch_holes": true})),
+        (
+            "mortise_tenon",
+            json!({
+                "type": "mortise_tenon",
+                "rail_face": o,
+                "stile_face": o,
+                "thickness": "mt.thickness",
+                "length": "mt.length",
+                "shoulder": "mt.shoulder",
+                "haunch_width": "mt.haunch_width",
+                "haunch_depth": "mt.haunch_depth",
+                "glue_relief": "mt.glue_relief",
+                "clearance": "mt.clearance",
+                "offset": "mt.offset"
+            }),
+        ),
     ]
 }
 
@@ -273,6 +289,7 @@ pub(super) fn with_refs(name: &str, mut v: Value) -> Value {
         "emboss" => json!({"face": {"body": "B", "at": o}, "targets": ["B"]}),
         "sheet_fold" => json!({"sketch": 7, "body": "B"}),
         "patch" => json!({"sketch": 8, "body": "B"}),
+        "mortise_tenon" => json!({"rail_body": "B", "stile_body": "B"}),
         _ => json!({}),
     };
     if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {

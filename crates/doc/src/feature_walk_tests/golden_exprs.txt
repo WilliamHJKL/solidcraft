@@ -448,3 +448,14 @@ repair
   inputs:
     Gap = repair.gap (Length)
   expressions: repair.gap
+mortise_tenon
+  inputs:
+    Tenon thickness = mt.thickness (Length)
+    Tenon length = mt.length (Length)
+    Shoulder = mt.shoulder (Length)
+    Haunch width = mt.haunch_width (Length)
+    Haunch depth = mt.haunch_depth (Length)
+    Glue relief = mt.glue_relief (Length)
+    Clearance = mt.clearance (Length)
+    Offset = mt.offset (Length)
+  expressions: mt.thickness, mt.length, mt.shoulder, mt.haunch_width, mt.haunch_depth, mt.glue_relief, mt.clearance, mt.offset

@@ -220,3 +220,6 @@ import
 mesh_convert
 mesh_import
 repair
+mortise_tenon
+  moves: rail_face[0], rail_face[1], rail_face[2], stile_face[0], stile_face[1], stile_face[2]
+  face points: [0, 0, 0], [0, 0, 0]
