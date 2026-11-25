@@ -64,7 +64,7 @@ pub(crate) struct State {
     /// The runs waiting in the control queue: each one's request serial and the session it is for.
     pending: Vec<(u64, u64)>,
     panel_pick: Option<PanelPick>,
-    panel_runs: Vec<std::sync::mpsc::Receiver<Value>>,
+    panel_runs: Vec<PanelRun>,
 }
 
 #[cfg(test)]
@@ -1224,6 +1224,14 @@ pub(crate) struct Running {
     source_guard: Option<solidcraft_engine::schema::plugin::FormGuard>,
 }
 
+/// A docked panel's action waiting for its reply (#22032).
+struct PanelRun {
+    reply: std::sync::mpsc::Receiver<Value>,
+    ticket: std::sync::Arc<solidcraft_control::Ticket>,
+    /// The design copied by the worker at dispatch: the forms the action asks for open against it.
+    source_guard: Option<solidcraft_engine::schema::plugin::FormGuard>,
+}
+
 /// Open the dialog of entry `e` of listed plugin `p`.
 pub(crate) fn open_entry(app: &mut SolveApp, p: usize, e: usize) {
     let Some(plugin) = app.plugin_menu.listed.get(p).cloned() else { return };
@@ -1995,7 +2003,7 @@ pub(crate) fn run_panel(app: &mut SolveApp, command: String, params: Value) -> R
     }
     let (request, reply) = solidcraft_control::ControlRequest::new("engine.execute", json!({"command":command,"params":params}));
     app.plugin_menu.pending.push((request.serial, app.session.uid));
-    app.plugin_menu.panel_runs.push(reply);
+    app.plugin_menu.panel_runs.push(PanelRun { reply, ticket: request.ticket.clone(), source_guard: None });
     app.control_held.push_back(request);
     Ok(())
 }
@@ -2012,6 +2020,8 @@ pub(crate) fn check_dispatch(app: &mut SolveApp, req: &solidcraft_control::Contr
             solidcraft_engine::schema::plugin::FormGuard { document_id: app.session.document_id.clone(), revision: app.session.design_revision() };
         if let Some(running) = app.plugin_menu.dialogs.iter_mut().filter_map(|d| d.running.as_mut()).find(|r| Arc::ptr_eq(&r.ticket, &req.ticket)) {
             running.source_guard = Some(guard);
+        } else if let Some(run) = app.plugin_menu.panel_runs.iter_mut().find(|r| Arc::ptr_eq(&r.ticket, &req.ticket)) {
+            run.source_guard = Some(guard);
         }
         Ok(())
     } else {
@@ -2021,17 +2031,19 @@ pub(crate) fn check_dispatch(app: &mut SolveApp, req: &solidcraft_control::Contr
 }
 
 /// Take the finished runs' replies: an edit closes its dialog, a read shows its result, an error
-/// stays in its dialog.
+/// stays in its dialog. A panel action's reply opens the forms it asked for, as a dialog's does.
 pub(crate) fn poll(app: &mut SolveApp) {
-    for reply in std::mem::take(&mut app.plugin_menu.panel_runs) {
-        match reply.try_recv() {
+    for run in std::mem::take(&mut app.plugin_menu.panel_runs) {
+        match run.reply.try_recv() {
             Ok(value) => {
-                if value.get("ok") != Some(&Value::Bool(true)) {
+                if value.get("ok") == Some(&Value::Bool(true)) {
+                    open_requested_forms(app, &value, run.source_guard);
+                } else {
                     let error = value.get("error").and_then(Value::as_str).unwrap_or_else(|| solidcraft_ui_text::tr("ui.plugin_no_result"));
                     app.set_status(solidcraft_ui_text::format("ui.plugin_dialog_failed", &[("error", error)]), true);
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => app.plugin_menu.panel_runs.push(reply),
+            Err(std::sync::mpsc::TryRecvError::Empty) => app.plugin_menu.panel_runs.push(run),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => app.set_status(app.tr("ui.plugin_no_result").to_owned(), true),
         }
     }

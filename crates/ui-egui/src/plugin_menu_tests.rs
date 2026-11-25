@@ -2478,6 +2478,39 @@ mod native {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A docked panel's action that asks for a form with `forms.open` opens it after the action
+    /// succeeds, against the design the worker copied at dispatch, as a Plugins-menu entry does
+    /// (#22032). A failed action opens nothing.
+    #[test]
+    fn a_panel_action_opens_the_form_it_asks_for_after_it_succeeds() {
+        let root = package("panel-form");
+        let mut h = crate::scenario::Harness::new();
+        h.app.plugin_menu.listed = list(&h.app, Some(&root));
+        h.app.plugin_menu.loaded = true;
+        let values = json!({"length":30,"width":10,"height":3});
+        let reply = json!({"ok":true,"result":{"result":{},"forms":[{"plugin":"boxes","entry":"make","params":values}]}});
+
+        run_panel(&mut h.app, "boxes.edit".into(), json!({})).unwrap();
+        let failed = h.app.control_held.pop_back().expect("the action waits in the control queue");
+        check_dispatch(&mut h.app, &failed).unwrap();
+        failed.reply.send(json!({"ok":false,"error":"no joint here"})).unwrap();
+        poll(&mut h.app);
+        assert!(h.app.plugin_menu.dialogs.is_empty(), "a failed action opens no form");
+
+        run_panel(&mut h.app, "boxes.edit".into(), json!({})).unwrap();
+        let request = h.app.control_held.pop_back().expect("the action waits in the control queue");
+        check_dispatch(&mut h.app, &request).unwrap();
+        let dispatched = h.app.session.design_revision();
+        request.reply.send(reply).unwrap();
+        poll(&mut h.app);
+        assert!(h.app.plugin_menu.panel_runs.is_empty(), "the finished action is taken");
+        let opened = h.app.plugin_menu.dialogs.iter().find(|d| d.entry == "make").expect("the form the action asked for opens");
+        let guard = opened.form_guard.as_ref().expect("the form keeps the design it was asked for");
+        assert_eq!(guard.revision, dispatched);
+        assert_eq!(guard.document_id, h.app.session.document_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn prefilled_form_apply_revalidates_changes_and_cancel_keeps_design_equal() {
         let root = package("prefill-apply");
